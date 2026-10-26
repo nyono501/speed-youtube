@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="速度YouTube">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.json">
+<title>速度つきYouTubeプレーヤー</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --mute:#999; --acc:#ff3d3d; --panel:#1c1c1c; --line:#333; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,"Yu Gothic UI",sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  form { display:flex; gap:8px; margin-bottom:12px; }
+  input[type=text] { flex:1; padding:10px 12px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:15px; }
+  button { cursor:pointer; border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:8px; padding:8px 14px; font-size:14px; }
+  button:hover { border-color:#666; }
+  button.on { background:var(--acc); border-color:var(--acc); color:#fff; font-weight:600; }
+  #stage { position:relative; background:#000; aspect-ratio:16/9; width:100%; border-radius:10px; overflow:hidden; }
+  #stage:fullscreen { border-radius:0; aspect-ratio:auto; height:100%; }
+  #player, #player iframe { position:absolute; inset:0; width:100%; height:100%; }
+  #shield { position:absolute; inset:0 0 56px 0; z-index:2; }  /* クリックを受けてフォーカスを保つ */
+  #badge { position:absolute; top:12px; right:12px; z-index:3; background:rgba(0,0,0,.65); padding:4px 12px; border-radius:20px; font-size:20px; font-weight:700; opacity:0; transition:opacity .25s; pointer-events:none; }
+  #badge.show { opacity:1; }
+  #bar { position:absolute; left:0; right:0; bottom:0; height:56px; z-index:3; display:flex; align-items:center; gap:10px; padding:0 12px; background:linear-gradient(transparent,rgba(0,0,0,.85)); }
+  #bar button { background:none; border:none; padding:4px 8px; font-size:18px; }
+  #seek { flex:1; accent-color:var(--acc); }
+  #vol { width:80px; accent-color:var(--acc); }
+  #time { font-variant-numeric:tabular-nums; color:#ddd; font-size:13px; min-width:100px; text-align:center; }
+  .speeds { display:flex; flex-wrap:wrap; gap:6px; margin:14px 0 6px; align-items:center; }
+  .speeds .lbl { color:var(--mute); margin-right:4px; }
+  .hint { color:var(--mute); font-size:13px; }
+  kbd { background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:0 6px; font-size:12px; }
+  #msg { color:#ff8a8a; min-height:1.5em; }
+  #stage.pfs { position:fixed; inset:0; z-index:99; width:100vw; height:100dvh; aspect-ratio:auto; border-radius:0; }
+  button { touch-action:manipulation; }
+  @media (pointer:coarse) {
+    .wrap { padding:12px; padding-left:max(12px,env(safe-area-inset-left)); padding-right:max(12px,env(safe-area-inset-right)); }
+    #vol, #mute, .hint kbd, .hint { display:none; }   /* 音量は端末側ボタン、キー操作は不要 */
+    .speeds button { flex:1 0 22%; padding:12px 0; font-size:16px; }
+    #bar { height:64px; } #shield { bottom:64px; }
+    #bar button { font-size:24px; padding:8px 12px; }
+    #seek { height:32px; }
+    input[type=text] { font-size:16px; } /* iOSの自動ズーム防止 */
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <form id="f">
+    <input type="text" id="url" placeholder="YouTubeのURL または 動画ID を貼り付け" autofocus>
+    <button type="submit">再生</button>
+  </form>
+  <div id="msg"></div>
+
+  <div id="stage">
+    <div id="player"></div>
+    <div id="shield"></div>
+    <div id="badge">1x</div>
+    <div id="bar">
+      <button id="pp" title="再生/停止 (Space)">▶</button>
+      <span id="time">0:00 / 0:00</span>
+      <input type="range" id="seek" min="0" max="1000" value="0">
+      <button id="mute" title="ミュート (M)">🔊</button>
+      <input type="range" id="vol" min="0" max="100" value="100">
+      <button id="fs" title="全画面 (F)">⛶</button>
+    </div>
+  </div>
+
+  <div class="speeds" id="speeds"><span class="lbl">再生速度</span></div>
+  <div class="hint">
+    <kbd>Space</kbd>/<kbd>K</kbd> 再生停止 ・ <kbd>←</kbd><kbd>→</kbd> 5秒 / <kbd>J</kbd><kbd>L</kbd> 10秒 ・
+    <kbd>↑</kbd><kbd>↓</kbd> 音量 ・ <kbd>.</kbd> 速く <kbd>,</kbd> 遅く ・ <kbd>1</kbd>〜<kbd>0</kbd> 速度プリセット ・
+    <kbd>R</kbd> 1xに戻す ・ <kbd>F</kbd> 全画面 ・ <kbd>M</kbd> ミュート<br>
+    ※YouTubeの仕様上、速度は最大2倍までです。速度は次回以降も記憶されます。
+  </div>
+</div>
+
+<script>
+const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+const PRESET_KEYS = { '1':0.5, '2':0.75, '3':1, '4':1.25, '5':1.5, '6':1.75, '7':2 };
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d){ try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch {} }
+};
+let rate = parseFloat(store.get('rate', '1')) || 1;
+let player, ready = false, timer, badgeTimer;
+
+// 速度ボタン生成
+RATES.forEach(r => {
+  const b = document.createElement('button');
+  b.textContent = r + 'x'; b.dataset.r = r;
+  b.onclick = () => setRate(r);
+  $('speeds').appendChild(b);
+});
+function refreshButtons(){
+  document.querySelectorAll('#speeds button').forEach(b => b.classList.toggle('on', parseFloat(b.dataset.r) === rate));
+}
+function setRate(r){
+  const list = ready && player.getAvailablePlaybackRates ? player.getAvailablePlaybackRates() : RATES;
+  const min = Math.min(...list), max = Math.max(...list);
+  rate = Math.min(max, Math.max(min, Math.round(r*100)/100));
+  if (ready) player.setPlaybackRate(rate);
+  store.set('rate', rate);
+  refreshButtons();
+  flash(rate + 'x');
+}
+function stepRate(dir){
+  const i = RATES.findIndex(r => r >= rate - 1e-6);
+  const cur = RATES.indexOf(rate) >= 0 ? RATES.indexOf(rate) : i;
+  setRate(RATES[Math.min(RATES.length-1, Math.max(0, cur + dir))]);
+}
+function flash(t){
+  $('badge').textContent = t; $('badge').classList.add('show');
+  clearTimeout(badgeTimer); badgeTimer = setTimeout(() => $('badge').classList.remove('show'), 900);
+}
+refreshButtons();
+
+// YouTube IFrame API
+const s = document.createElement('script'); s.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(s);
+window.onYouTubeIframeAPIReady = () => {
+  player = new YT.Player('player', {
+    playerVars: { controls:0, disablekb:1, rel:0, playsinline:1, modestbranding:1, fs:0 },
+    events: {
+      onReady: () => { ready = true; const q = new URLSearchParams(location.search).get('v'); if (q) load(q); },
+      onStateChange: e => {
+        $('pp').textContent = e.data === YT.PlayerState.PLAYING ? '⏸' : '▶';
+        if (e.data === YT.PlayerState.PLAYING) player.setPlaybackRate(rate); // 動画切替後も速度維持
+      },
+      onError: e => { $('msg').textContent = '再生できません (エラー ' + e.data + ')。埋め込みが禁止されている動画の可能性があります。'; }
+    }
+  });
+};
+
+function parse(input){
+  input = input.trim();
+  if (/^[\w-]{11}$/.test(input)) return { v: input };
+  try {
+    const u = new URL(input);
+    const list = u.searchParams.get('list');
+    let v = u.searchParams.get('v');
+    if (u.hostname === 'youtu.be') v = u.pathname.slice(1);
+    const m = u.pathname.match(/\/(shorts|embed|live)\/([\w-]{11})/); if (m) v = m[2];
+    if (v || list) return { v, list };
+  } catch {}
+  return null;
+}
+function load(input){
+  $('msg').textContent = '';
+  const p = parse(input);
+  if (!p) { $('msg').textContent = 'URLまたは動画IDを認識できませんでした。'; return; }
+  if (!ready) return;
+  if (p.v) player.loadVideoById(p.v);
+  else player.loadPlaylist({ list: p.list, listType: 'playlist' });
+  player.setPlaybackRate(rate);
+  const q = new URLSearchParams(); if (p.v) q.set('v', p.v);
+  history.replaceState(null, '', '?' + q);
+}
+$('f').onsubmit = e => { e.preventDefault(); load($('url').value); $('url').blur(); };
+
+// 操作
+const fmt = t => { t = Math.floor(t||0); const h=Math.floor(t/3600), m=Math.floor(t%3600/60), s=t%60;
+  return (h? h+':'+String(m).padStart(2,'0') : m) + ':' + String(s).padStart(2,'0'); };
+function toggle(){ if(!ready) return; player.getPlayerState() === YT.PlayerState.PLAYING ? player.pauseVideo() : player.playVideo(); }
+function seekBy(d){ if(!ready) return; player.seekTo(player.getCurrentTime() + d, true); flash((d>0?'+':'') + d + '秒'); }
+function setVol(v){ if(!ready) return; v = Math.min(100, Math.max(0, v)); player.setVolume(v); player.unMute(); $('vol').value = v; $('mute').textContent = v ? '🔊' : '🔇'; flash('音量 ' + v); }
+function toggleMute(){ if(!ready) return; if (player.isMuted()) { player.unMute(); $('mute').textContent='🔊'; } else { player.mute(); $('mute').textContent='🔇'; } }
+function fs(){
+  const st = $('stage');
+  const req = st.requestFullscreen || st.webkitRequestFullscreen;
+  if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); }
+  else if (req) { req.call(st); }
+  else { st.classList.toggle('pfs'); } // iPhoneなど要素の全画面に非対応の場合は画面いっぱい表示で代用
+}
+
+$('pp').onclick = toggle; $('shield').onclick = toggle; $('shield').ondblclick = fs;
+$('mute').onclick = toggleMute; $('fs').onclick = fs;
+$('vol').oninput = e => setVol(+e.target.value);
+let dragging = false;
+$('seek').oninput = e => { dragging = true; if (ready) $('time').textContent = fmt(e.target.value/1000*player.getDuration()) + ' / ' + fmt(player.getDuration()); };
+$('seek').onchange = e => { if (ready) player.seekTo(e.target.value/1000*player.getDuration(), true); dragging = false; e.target.blur(); };
+setInterval(() => {
+  if (!ready || !player.getDuration || dragging) return;
+  const d = player.getDuration(), c = player.getCurrentTime();
+  if (d) { $('seek').value = c/d*1000; $('time').textContent = fmt(c) + ' / ' + fmt(d); }
+}, 250);
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key; let hit = true;
+  if (k === ' ' || k === 'k') toggle();
+  else if (k === 'ArrowLeft') seekBy(-5);
+  else if (k === 'ArrowRight') seekBy(5);
+  else if (k === 'j') seekBy(-10);
+  else if (k === 'l') seekBy(10);
+  else if (k === 'ArrowUp') setVol(player.getVolume() + 5);
+  else if (k === 'ArrowDown') setVol(player.getVolume() - 5);
+  else if (k === '.' || k === '>') stepRate(1);
+  else if (k === ',' || k === '<') stepRate(-1);
+  else if (k === 'r') setRate(1);
+  else if (k === 'f') fs();
+  else if (k === 'm') toggleMute();
+  else if (k === '0') setRate(2);
+  else if (PRESET_KEYS[k]) setRate(PRESET_KEYS[k]);
+  else hit = false;
+  if (hit) { e.preventDefault(); if (document.activeElement && document.activeElement.tagName === 'BUTTON') document.activeElement.blur(); }
+});
+</script>
+</body>
+</html>
